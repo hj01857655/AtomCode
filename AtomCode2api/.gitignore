@@ -1,0 +1,8 @@
+# 明文凭据与运行日志，绝不入库
+credentials.json
+credentials.json.tmp
+server.log*
+__pycache__/
+.env
+request.log*
+dumps/

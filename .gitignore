@@ -1,0 +1,7 @@
+# upstream 源码克隆（自带 .git，不入本仓库）
+atomcode/
+# 抓包记录
+cap/
+node_modules/
+.atomcode/
+.breezell/
