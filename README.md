@@ -3,19 +3,6 @@
 对 AtomCode CLI（atomcode-v5.1.0-windows-x64.exe）的逆向分析成果，以及基于它的
 CodingPlan → OpenAI 兼容 API 网关（`AtomCode2api/`）。
 
-## 目录结构
-
-```
-AtomCode/
-├── README.md                  # 本文件
-├── quota.sh                   # 额度查询脚本
-└── AtomCode2api/
-    ├── server.py              # 网关路由层（Flask：OpenAI 兼容 + /login OAuth + OpenRouter 反代）
-    ├── auth.py                # 认证层（共用 ~/.atomcode/auth.toml + mtime 热加载 + RT 轮换刷新写回）
-    ├── server.log             # 运行日志（2MB 轮换，[rNNNN] 关联 ID + ttft/tokens）
-    └── docs/                  # 全部文档（索引见其 README.md）
-```
-
 ## 核心结论速览
 
 | 项 | 结论 |
