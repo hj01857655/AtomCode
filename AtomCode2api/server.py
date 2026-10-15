@@ -32,6 +32,7 @@ load_dotenv()
 
 # 认证模块（OAuthLogin / Credential / 凭据文件）在 auth.py
 from auth import Credential, NotLoggedInError, oauth_session, save_credentials
+import responses_bridge as rb
 
 # ── 日志 ──────────────────────────────────────────────────────────────
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.log")
@@ -246,6 +247,114 @@ def list_models():
     return jsonify({"object": "list", "data": data})
 
 
+# ── 上游发送（chat 与 responses 路由共用）──────────────────────────────
+def _send_openrouter(body, req_id):
+    """OpenRouter 分支：POST 并返回 (resp, err)。
+
+    成功 err=None，resp 为上游响应（调用方负责 close）；
+    失败 resp=None，err 为直接返回客户端的 (jsonify, status)。
+    """
+    or_headers = {
+        "Authorization": "Bearer " + OPENROUTER_API_KEY,
+        "Content-Type": "application/json",
+        "User-Agent": UPSTREAM_UA,
+        # OpenRouter app-attribution（官方 CLI 同款，openai_compat.rs:
+        # OPENROUTER_ATTRIBUTION_HEADERS）：免费模型有 agentic harness 门，
+        # 缺这两个头会被 403
+        "HTTP-Referer": "https://gitcode.com/atomgit_atomcode/atomcode",
+        "X-Title": "AtomCode",
+    }
+    try:
+        resp = requests.post(OPENROUTER_BASE + "/chat/completions",
+                             json=body, headers=or_headers, stream=True, timeout=120)
+    except requests.exceptions.Timeout:
+        log.error("OpenRouter 超时 (120s): model=%s", body.get("model"))
+        return None, (jsonify({"error": {
+            "message": "OpenRouter 上游请求超时 (120s)",
+            "type": "upstream_error",
+        }}), 504)
+    except requests.exceptions.RequestException as e:
+        log.error("OpenRouter 连接失败: %s", e)
+        return None, (jsonify({"error": {
+            "message": "OpenRouter 上游连接失败: %s" % e,
+            "type": "upstream_error",
+        }}), 502)
+    if resp.status_code != 200:
+        err = resp.text[:1000]
+        resp.close()
+        log.error("OpenRouter HTTP %s: model=%s err=%s", resp.status_code, body.get("model"), err)
+        return None, (jsonify({"error": {
+            "message": "OpenRouter 错误 (HTTP %s): %s" % (resp.status_code, err),
+            "type": "upstream_error",
+        }}), resp.status_code)
+    return resp, None
+
+
+def _send_codingplan(body, req_id, model_id):
+    """CodingPlan 分支：瞬时错误退避重试 + 401 刷新重试一次。
+
+    返回 (resp, err)，约定同 _send_openrouter。
+    """
+    url = LLM_BASE + "/chat/completions"
+
+    def _post():
+        # 每次调用现取 cred.headers()——刷新后拿到的是新 token
+        return requests.post(url, json=body, headers=cred.headers(), stream=True, timeout=120)
+
+    # 瞬时错误退避重试：上游 LiteLLM 偶发 502/503（客户端表现为「请求负载过高」），
+    # 网关层重试吃掉，退避 0.5/1/2s 共 1+3 次。403 是 UA 门/权限错不重试；
+    # 401 只刷新 token 重试一次。
+    RETRY_STATUSES = {429, 500, 502, 503, 504}
+    resp = None
+    refreshed = False
+    for attempt in range(4):
+        try:
+            resp = _post()
+        except requests.exceptions.Timeout:
+            log.error("[%s] 上游超时 (120s): model=%s (第%d次)", req_id, model_id, attempt + 1)
+            return None, (jsonify({"error": {
+                "message": "上游请求超时 (120s)，模型响应过慢或服务繁忙",
+                "type": "upstream_error",
+            }}), 504)
+        except requests.exceptions.RequestException as e:
+            log.error("[%s] 上游连接失败: %s (第%d次)", req_id, e, attempt + 1)
+            return None, (jsonify({"error": {
+                "message": "上游连接失败: %s" % e,
+                "type": "upstream_error",
+            }}), 502)
+        if resp.status_code == 401 and not refreshed:
+            refreshed = True
+            resp.close()
+            log.warning("[%s] 上游 401，刷新 token 重试", req_id)
+            try:
+                cred.refresh()
+            except Exception as e:
+                log.error("token 刷新失败: %s", e)
+                return None, (jsonify({"error": {
+                    "message": "token 刷新失败: %s" % e,
+                    "type": "auth_error",
+                }}), 401)
+            continue
+        if resp.status_code in RETRY_STATUSES and attempt < 3:
+            wait = 0.5 * (2 ** attempt)
+            log.warning("[%s] 上游 HTTP %s (第%d次), %.1fs 后重试: model=%s",
+                        req_id, resp.status_code, attempt + 1, wait, model_id)
+            resp.close()
+            time.sleep(wait)
+            continue
+        break
+
+    if resp.status_code != 200:
+        err = resp.text[:1000]
+        resp.close()
+        log.error("[%s] 上游 HTTP %s: model=%s err=%s", req_id, resp.status_code, model_id, err)
+        return None, (jsonify({"error": {
+            "message": "上游错误 (HTTP %s): %s" % (resp.status_code, err),
+            "type": "upstream_error",
+        }}), resp.status_code)
+    return resp, None
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     denied = _guard() or _cred_guard()
@@ -278,39 +387,9 @@ def chat_completions():
             }}), 401
         or_body = dict(body)
         or_body["model"] = _openrouter_upstream_model(model_id)
-        or_headers = {
-            "Authorization": "Bearer " + OPENROUTER_API_KEY,
-            "Content-Type": "application/json",
-            "User-Agent": UPSTREAM_UA,
-            # OpenRouter app-attribution（官方 CLI 同款，openai_compat.rs:
-            # OPENROUTER_ATTRIBUTION_HEADERS）：免费模型有 agentic harness 门，
-            # 缺这两个头会被 403
-            "HTTP-Referer": "https://gitcode.com/atomgit_atomcode/atomcode",
-            "X-Title": "AtomCode",
-        }
-        try:
-            resp = requests.post(OPENROUTER_BASE + "/chat/completions",
-                                 json=or_body, headers=or_headers, stream=True, timeout=120)
-        except requests.exceptions.Timeout:
-            log.error("OpenRouter 超时 (120s): model=%s", or_body.get("model"))
-            return jsonify({"error": {
-                "message": "OpenRouter 上游请求超时 (120s)",
-                "type": "upstream_error",
-            }}), 504
-        except requests.exceptions.RequestException as e:
-            log.error("OpenRouter 连接失败: %s", e)
-            return jsonify({"error": {
-                "message": "OpenRouter 上游连接失败: %s" % e,
-                "type": "upstream_error",
-            }}), 502
-        if resp.status_code != 200:
-            err = resp.text[:1000]
-            resp.close()
-            log.error("OpenRouter HTTP %s: model=%s err=%s", resp.status_code, or_body.get("model"), err)
-            return jsonify({"error": {
-                "message": "OpenRouter 错误 (HTTP %s): %s" % (resp.status_code, err),
-                "type": "upstream_error",
-            }}), resp.status_code
+        resp, err = _send_openrouter(or_body, req_id)
+        if err is not None:
+            return err
         want_stream = bool(body.get("stream"))
         t0 = time.time()
         if not want_stream:
@@ -341,68 +420,14 @@ def chat_completions():
         return Response(or_generate(), status=200, mimetype="text/event-stream")
 
     # ── CodingPlan 路由 ──
-    url = LLM_BASE + "/chat/completions"
-
     # 对齐官方 CLI（openai_compat.rs:1335）：必带 include_usage，上游才会在
     # 流末尾发 usage 块——这是额度观察与记账的依据。客户端已带则尊重客户端。
     if body.get("stream") and not body.get("stream_options"):
         body = dict(body, stream_options={"include_usage": True})
 
-    def _post():
-        # 每次调用现取 cred.headers()——刷新后拿到的是新 token
-        return requests.post(url, json=body, headers=cred.headers(), stream=True, timeout=120)
-
-    # 瞬时错误退避重试：上游 LiteLLM 偶发 502/503（客户端表现为「请求负载过高」），
-    # 网关层重试吃掉，退避 0.5/1/2s 共 1+3 次。403 是 UA 门/权限错不重试；
-    # 401 只刷新 token 重试一次。
-    RETRY_STATUSES = {429, 500, 502, 503, 504}
-    resp = None
-    refreshed = False
-    for attempt in range(4):
-        try:
-            resp = _post()
-        except requests.exceptions.Timeout:
-            log.error("[%s] 上游超时 (120s): model=%s (第%d次)", req_id, model_id, attempt + 1)
-            return jsonify({"error": {
-                "message": "上游请求超时 (120s)，模型响应过慢或服务繁忙",
-                "type": "upstream_error",
-            }}), 504
-        except requests.exceptions.RequestException as e:
-            log.error("[%s] 上游连接失败: %s (第%d次)", req_id, e, attempt + 1)
-            return jsonify({"error": {
-                "message": "上游连接失败: %s" % e,
-                "type": "upstream_error",
-            }}), 502
-        if resp.status_code == 401 and not refreshed:
-            refreshed = True
-            resp.close()
-            log.warning("[%s] 上游 401，刷新 token 重试", req_id)
-            try:
-                cred.refresh()
-            except Exception as e:
-                log.error("token 刷新失败: %s", e)
-                return jsonify({"error": {
-                    "message": "token 刷新失败: %s" % e,
-                    "type": "auth_error",
-                }}), 401
-            continue
-        if resp.status_code in RETRY_STATUSES and attempt < 3:
-            wait = 0.5 * (2 ** attempt)
-            log.warning("[%s] 上游 HTTP %s (第%d次), %.1fs 后重试: model=%s",
-                        req_id, resp.status_code, attempt + 1, wait, model_id)
-            resp.close()
-            time.sleep(wait)
-            continue
-        break
-
-    if resp.status_code != 200:
-        err = resp.text[:1000]
-        resp.close()
-        log.error("[%s] 上游 HTTP %s: model=%s err=%s", req_id, resp.status_code, model_id, err)
-        return jsonify({"error": {
-            "message": "上游错误 (HTTP %s): %s" % (resp.status_code, err),
-            "type": "upstream_error",
-        }}), resp.status_code
+    resp, err = _send_codingplan(body, req_id, model_id)
+    if err is not None:
+        return err
 
     want_stream = bool(body.get("stream"))
     t0 = time.time()
@@ -509,6 +534,146 @@ def chat_completions():
             resp.close()
 
     return Response(generate(), status=200, mimetype="text/event-stream")
+
+
+def _first_content_line(line):
+    """从 Chat SSE 原始行提取 delta.content（非内容帧返回 None）。"""
+    try:
+        s = line.decode("utf-8", "ignore") if isinstance(line, (bytes, bytearray)) else str(line)
+        s = s.strip()
+        if not s.startswith("data:"):
+            return None
+        payload = s[5:].strip()
+        if not payload or payload == "[DONE]":
+            return None
+        d = json.loads(payload)
+        for ch in (d.get("choices") or []):
+            c = (ch.get("delta") or {}).get("content")
+            if c:
+                return c
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return None
+
+
+# ── OpenAI Responses 端点（grok-build / Codex 等原生 Responses 客户端）──────
+# 上游仍是 Chat 协议：请求体经 responses_bridge 转成 Chat，复用两条上游发送
+# 分支（_send_openrouter / _send_codingplan）；响应侧包成 Responses SSE
+# （每帧带 sequence_number）。额度伪回复识别与 chat 路由同款。
+@app.route("/v1/responses", methods=["POST"])
+def responses_api():
+    denied = _guard() or _cred_guard()
+    if denied:
+        return denied
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not body:
+        return jsonify({"error": {"message": "invalid request: JSON object body required",
+                                  "type": "invalid_request_error"}}), 400
+
+    chat_body = rb.responses_to_chat(body)
+    if not chat_body.get("messages"):
+        return jsonify({"error": {"message": "invalid request: 'input' is required",
+                                  "type": "invalid_request_error"}}), 400
+
+    model_id = body.get("model", "")
+    req_id = _next_req_id()
+    want_stream = bool(chat_body.get("stream"))
+
+    # 与 chat 同款：流式必带 include_usage，上游才会在流末发 usage 块
+    if want_stream and not chat_body.get("stream_options"):
+        chat_body = dict(chat_body, stream_options={"include_usage": True})
+
+    if _is_openrouter_model(model_id):
+        if not OPENROUTER_API_KEY:
+            return jsonify({"error": {
+                "message": "OpenRouter API key 未配置（在 ~/.atomcode/config.toml 或 OPENROUTER_API_KEY 环境变量）",
+                "type": "auth_error",
+            }}), 401
+        or_body = dict(chat_body)
+        or_body["model"] = _openrouter_upstream_model(model_id)
+        resp, err = _send_openrouter(or_body, req_id)
+    else:
+        resp, err = _send_codingplan(chat_body, req_id, model_id)
+    if err is not None:
+        return err
+
+    t0 = time.time()
+
+    if want_stream:
+        def chat_lines():
+            """上游 Chat SSE 行流 + 额度伪回复拦截（首个内容命中即转错误帧）。"""
+            intercept = True
+            for line in resp.iter_lines(decode_unicode=False):
+                if intercept:
+                    c = _first_content_line(line)
+                    if c:
+                        pseudo = _detect_pseudo_reply(c)
+                        if pseudo:
+                            kind, reset = pseudo
+                            log.warning("[%s] quota(%s) model=%s reset=%s —— 流内伪回复替换为 SSE error",
+                                        req_id, kind, model_id, reset or "?")
+                            err = {"error": {
+                                "message": c,
+                                "type": "rate_limit_error" if kind == "quota_exhausted" else "overloaded_error",
+                                "code": kind,
+                                "reset_at": reset,
+                                "retry_after": _retry_after_seconds(reset),
+                            }}
+                            yield b"data: " + json.dumps(err, ensure_ascii=False,
+                                                         separators=(",", ":")).encode("utf-8") + b"\n\n"
+                            return
+                        intercept = False
+                yield line
+
+        def generate():
+            total = 0
+            try:
+                for frame in rb.chat_sse_to_responses(chat_lines(), model_id):
+                    total += len(frame)
+                    yield frame
+                log.info("[%s] done: responses %dB %.1fs", req_id, total, time.time() - t0)
+            except GeneratorExit:
+                log.warning("[%s] client 断开: responses %dB %.1fs", req_id, total, time.time() - t0)
+                raise
+            except Exception as e:
+                log.error("[%s] 流中断: responses %dB %.1fs err=%s", req_id, total, time.time() - t0, e)
+            finally:
+                resp.close()
+
+        return Response(generate(), status=200, mimetype="text/event-stream")
+
+    # 非流式：上游返回普通 Chat JSON（body 里 stream=false）
+    content = resp.content
+    resp.close()
+    try:
+        chat_json = json.loads(content.decode("utf-8", "ignore"))
+        _txt = (chat_json.get("choices") or [{}])[0].get("message", {}).get("content")
+    except (ValueError, AttributeError, IndexError, TypeError):
+        chat_json, _txt = None, None
+    # 上游把额度耗尽/过载伪装成 200 的正常回复文本，识别后转正规 429（与 chat 同款）
+    pseudo = _detect_pseudo_reply(_txt)
+    if pseudo:
+        kind, reset = pseudo
+        wait = _retry_after_seconds(reset)
+        log.warning("[%s] quota(%s) model=%s reset=%s —— 200 伪回复转 429",
+                    req_id, kind, model_id, reset or "?")
+        body_err = {"error": {
+            "message": _txt,
+            "type": "rate_limit_error" if kind == "quota_exhausted" else "overloaded_error",
+            "code": kind,
+            "reset_at": reset,
+        }}
+        headers = {"Retry-After": str(wait)} if wait else {}
+        return jsonify(body_err), 429, headers
+    if not isinstance(chat_json, dict):
+        return jsonify({"error": {"message": "upstream returned non-JSON body",
+                                  "type": "upstream_error"}}), 502
+    out = rb.chat_json_to_responses(chat_json, model_id)
+    payload = json.dumps(out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    log.info("[%s] done: responses %dB %.1fs", req_id, len(payload), time.time() - t0)
+    return Response(payload, status=200,
+                    content_type="application/json; charset=utf-8")
 
 
 @app.route("/login", methods=["GET"])

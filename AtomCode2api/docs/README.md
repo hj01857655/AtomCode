@@ -13,7 +13,7 @@
 | 02 | [control-plane](atomcode-02-控制面与额度.md) | 控制面与额度 | models-v2/usage/status-v2/claim-v2 全部 Bearer 直通；5h×200 次窗口；claim-v2 是必须步骤；含 /model 全览（CodingPlan 2 个 + OpenRouter 5 个） |
 | 03 | [data-plane](atomcode-03-数据面与UA门.md) | 数据面与 UA 门 | **签名不需要**：api-ai.gitcode.com 按 UA 放行，换掉 atomcode/* 即 200 |
 | 04 | [auth](atomcode-04-认证流.md) | 认证流 | OAuth + RT 轮换刷新（7 天 AT / 60 天 RT），刷新返回新 RT 旧值作废 |
-| 05 | [signature-archive](atomcode-05-签名历史存档.md) | 签名历史（作废） | 穷举 800 万+ 未命中但已不需要；MITM 工具链保留做回归 |
+| 06 | [sign-spec](atomcode-06-签名算法规范.md) | 签名算法规范（唯一权威，含证据附录） | sign_v1 全链闭环：D=HMAC(M,K)、OKM=HMAC(D,info‖0x01)、Sig="v1:"+HMAC(OKM,canonical)；可全离线签发（仅 D1 生成公式未还原，实值已入库）；服务端当前不强制验签，免费档也签名 |
 | — | [codingplan-quota](codingplan-quota.md) | 额度机制详解 | 滑动窗口规则、响应结构体还原、字段速查、错误码、quota.sh 查询用法 |
 
 ## 网关设计

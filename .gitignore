@@ -3,5 +3,14 @@ atomcode/
 # 抓包记录
 cap/
 node_modules/
+atomcode-desktop/
 .atomcode/
 .breezell/
+
+# 逆向抓包产物（日志 / 失败备份 / 流量转储 / 凭证备份，不入库）
+*.log
+*.bak
+AtomCode2api/tools/crypto/indep/wire_dump*.txt
+AtomCode2api/tools/crypto/indep/auth_backup_prelogin.toml
+# 内含实拍 token 的 E2E 脚本（凭证不入库；要用请改成读环境变量）
+AtomCode2api/tools/crypto/indep/sig_e2e.py
