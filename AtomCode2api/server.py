@@ -33,6 +33,7 @@ load_dotenv()
 # 认证模块（OAuthLogin / Credential / 凭据文件）在 auth.py
 from auth import Credential, NotLoggedInError, oauth_session, save_credentials
 import responses_bridge as rb
+import anthropic_bridge as ab
 
 # ── 日志 ──────────────────────────────────────────────────────────────
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.log")
@@ -672,6 +673,114 @@ def responses_api():
     out = rb.chat_json_to_responses(chat_json, model_id)
     payload = json.dumps(out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     log.info("[%s] done: responses %dB %.1fs", req_id, len(payload), time.time() - t0)
+    return Response(payload, status=200,
+                    content_type="application/json; charset=utf-8")
+
+
+# ── Anthropic Messages 端点（Claude Code / Kiro 等原生 Anthropic 客户端）──────
+# 与 /v1/responses 同构：anthropic_bridge 把 Anthropic ⇄ Chat 翻掉，复用两条
+# 上游发送分支；额度伪回复识别与 chat/responses 同款。
+@app.route("/v1/messages", methods=["POST"])
+def messages_api():
+    denied = _guard() or _cred_guard()
+    if denied:
+        return denied
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not body.get("messages"):
+        return jsonify(ab.error_body("invalid_request_error",
+            "invalid request: 'messages' is required")), 400
+
+    chat_body = ab.anthropic_to_chat(body)
+    if not chat_body.get("messages"):
+        return jsonify(ab.error_body("invalid_request_error",
+            "invalid request: 'messages' is required")), 400
+
+    model_id = body.get("model", "")
+    req_id = _next_req_id()
+    want_stream = bool(chat_body.get("stream"))
+
+    if want_stream and not chat_body.get("stream_options"):
+        chat_body = dict(chat_body, stream_options={"include_usage": True})
+
+    if _is_openrouter_model(model_id):
+        if not OPENROUTER_API_KEY:
+            return jsonify(ab.error_body("authentication_error",
+                "OpenRouter API key 未配置")), 401
+        or_body = dict(chat_body)
+        or_body["model"] = _openrouter_upstream_model(model_id)
+        resp, err = _send_openrouter(or_body, req_id)
+    else:
+        resp, err = _send_codingplan(chat_body, req_id, model_id)
+    if err is not None:
+        return err
+
+    t0 = time.time()
+
+    if want_stream:
+        def chat_lines():
+            intercept = True
+            for line in resp.iter_lines(decode_unicode=False):
+                if intercept:
+                    c = _first_content_line(line)
+                    if c:
+                        pseudo = _detect_pseudo_reply(c)
+                        if pseudo:
+                            kind, reset = pseudo
+                            log.warning("[%s] quota(%s) model=%s reset=%s —— 流内伪回复替换为 SSE error",
+                                        req_id, kind, model_id, reset or "?")
+                            err = {"error": {
+                                "message": c,
+                                "type": "rate_limit_error" if kind == "quota_exhausted" else "overloaded_error",
+                                "code": kind,
+                                "reset_at": reset,
+                                "retry_after": _retry_after_seconds(reset),
+                            }}
+                            yield b"data: " + json.dumps(err, ensure_ascii=False,
+                                                         separators=(",", ":")).encode("utf-8") + b"\n\n"
+                            return
+                        intercept = False
+                yield line
+
+        def generate():
+            total = 0
+            try:
+                for frame in ab.chat_sse_to_anthropic(chat_lines(), model_id):
+                    total += len(frame)
+                    yield frame
+                log.info("[%s] done: messages %dB %.1fs", req_id, total, time.time() - t0)
+            except GeneratorExit:
+                log.warning("[%s] client 断开: messages %dB %.1fs", req_id, total, time.time() - t0)
+                raise
+            except Exception as e:
+                log.error("[%s] 流中断: messages %dB %.1fs err=%s", req_id, total, time.time() - t0, e)
+            finally:
+                resp.close()
+
+        return Response(generate(), status=200, mimetype="text/event-stream")
+
+    content = resp.content
+    resp.close()
+    try:
+        chat_json = json.loads(content.decode("utf-8", "ignore"))
+        _txt = (chat_json.get("choices") or [{}])[0].get("message", {}).get("content")
+    except (ValueError, AttributeError, IndexError, TypeError):
+        chat_json, _txt = None, None
+    pseudo = _detect_pseudo_reply(_txt)
+    if pseudo:
+        kind, reset = pseudo
+        wait = _retry_after_seconds(reset)
+        log.warning("[%s] quota(%s) model=%s reset=%s —— 200 伪回复转 429",
+                    req_id, kind, model_id, reset or "?")
+        et = "rate_limit_error" if kind == "quota_exhausted" else "overloaded_error"
+        body_err = ab.error_body(et, _txt)
+        headers = {"Retry-After": str(wait)} if wait else {}
+        return jsonify(body_err), 429, headers
+    if not isinstance(chat_json, dict):
+        return jsonify(ab.error_body("api_error", "upstream returned non-JSON body")), 502
+    out = ab.chat_json_to_anthropic(chat_json, model_id)
+    payload = json.dumps(out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    log.info("[%s] done: messages %dB %.1fs", req_id, len(payload), time.time() - t0)
     return Response(payload, status=200,
                     content_type="application/json; charset=utf-8")
 
